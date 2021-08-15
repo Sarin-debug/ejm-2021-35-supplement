@@ -1,13 +1,15 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[3]:
+# In[ ]:
 
 
 import torch
+import numpy as np
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import pandas as pd
+import math
 
 def import_Excel_data(file_name,sheet_name):
     Cpx_data = pd.read_excel(file_name,sheet_name=sheet_name,usecols="AE,AF,AH,AI:AM,AP",skiprows=1)#Si,Ti,Cr,Fe,Mn,Mg,Ca,Na,AlVI
@@ -19,23 +21,24 @@ def import_Excel_data(file_name,sheet_name):
     
     return Cpx_data,P_data
 
-device = torch.device('cuda'if torch.cuda.is_available() else 'cpu') 
+device = torch.device('cuda'if torch.cuda.is_available() else 'cpu')#utilize GPU for computation 
 
-#Import data
-Train_data,Train_data_P = import_Excel_data('Table S1.xlsx','calibration dataset')
-Test_data,Test_data_P = import_Excel_data('Table S1.xlsx','test dataset')
-Train_data = torch.tensor(Train_data.values,dtype = torch.float32).to(device)
-Train_data_P = torch.tensor(Train_data_P.values,dtype = torch.float32).to(device)
-Test_data = torch.tensor(Test_data.values,dtype = torch.float32).to(device)
-Test_data_P = torch.tensor(Test_data_P.values,dtype = torch.float32).to(device)
+Data_x,P = import_Excel_data('Table S1.xlsx','Cali&Validation data')#load train and test data (i.e. calibration and validation data in text)
+Data_x = np.array(Data_x.values)
+P = np.array(P.values)
+Data = np.concatenate((Data_x,P),axis=1)
 
+train_loss = torch.tensor([]).to(device)#tensor used to record loss value of each loop
+test_loss = torch.tensor([]).to(device)
+
+#built the non-linear barometric model
 class baromodel(nn.Module):
     def __init__(self):
         super(baromodel,self).__init__()
         self.input_Layer1 = nn.Linear(5,1)
         self.input_Layer2 = nn.Linear(5,1,bias=False)
-        self.a = torch.nn.Parameter(torch.tensor([1.],requires_grad=True))#parameter of Al_VI in NCT
-        self.b = torch.nn.Parameter(torch.tensor([1.],requires_grad=True))#parameter before NCT
+        self.a = torch.nn.Parameter(torch.tensor([1.],requires_grad=True))
+        self.b = torch.nn.Parameter(torch.tensor([1.],requires_grad=True))
 
     def forward(self,X):
         Si = X[:,[0]]
@@ -52,39 +55,57 @@ class baromodel(nn.Module):
         Linear = self.input_Layer1(X_1)
         
         X_2 = torch.cat((Ti,Cr,Fe,Mn,Mg),1)
-        NCT = ((self.a*AlVI))/(self.input_Layer2(X_2)+self.a*AlVI)
+        NLT = ((self.a*AlVI))/(self.input_Layer2(X_2)+self.a*AlVI)*torch.log(AlVI)
 
-        P_pred = self.b*NCT*torch.log(AlVI) + Linear
+        P_pred = self.b*NLT + Linear
         return P_pred
-    
-#Hyperparameter
-cpx_barometer = baromodel().to(device)
-criterion = nn.MSELoss().to(device)
-lr = 0.01
-optimizer = torch.optim.Adam(cpx_barometer.parameters(),lr=lr)
-
-for it in range(1000):
-    y_train_pred = cpx_barometer(Train_data)
-    loss_train = criterion(y_train_pred,Train_data_P)
-    optimizer.zero_grad()
-    loss_train.backward()
-    optimizer.step()
-    if it%5000 == 0:
-        print(it,"loss_train:",loss_train.item())
-
-y_test_pred = cpx_barometer(Test_data)
-loss_test = criterion(y_test_pred,Test_data_P)
-
-print("loss_train:",loss_train.item())
-print("loss_test:",loss_test.item())
-plt.scatter(Train_data_P.cpu().detach().numpy(),y_train_pred.cpu().detach().numpy())
-plt.scatter(Test_data_P.cpu().detach().numpy(),y_test_pred.cpu().detach().numpy())
-
-for parameters in cpx_barometer.parameters():
-    print(parameters)
 
 
+for j in range(100):
+    np.random.seed(j)
 
+    for i in range (7):
+        if i==0:
+            data = Data[Data[:,9] == 0.001,:]#extract data of P=0.001kbar
+            np.random.shuffle(data)#randomly sort
+            a = math.floor(0.8*len(data))
+            b = math.floor(len(data))
+            Test_data = data[a:b]#extract the first 80% as calibration dataset
+            Train_data = data[0:a]#the remaining data as validation dataset
+        else:
+            idx = np.where((Data[:,9]>(2*i-2+0.00103))&(Data[:,9]<=2*i))#extract data of 2i-2<P<=2i,except 0.001kbar data
+            data = Data[idx]
+            np.random.shuffle(data)#randomly sort
+            a = math.floor(0.8*len(data))
+            b = math.floor(len(data))
+            Train_data = np.concatenate((Train_data,data[0:a,:]),0)
+            Test_data = np.concatenate((Test_data,data[a:b,:]),0)
 
+    Train_data_x = torch.tensor(Train_data[:,0:9],dtype=torch.float32).to(device)#load data into GPU
+    Train_data_P = torch.tensor(Train_data[:,[9]],dtype=torch.float32).to(device)
+    Test_data_x = torch.tensor(Test_data[:,0:9],dtype=torch.float32).to(device)
+    Test_data_P = torch.tensor(Test_data[:,[9]],dtype=torch.float32).to(device)
+    cpx_barometer = baromodel().to(device)#load model into GPU
+    #cpx_barometer.load_state_dict(torch.load("cpxbar_para.pth"))#load pretrained parameters
+    criterion = nn.MSELoss()#define loss function
+    lr = 0.01#set initial learning rate
+    optimizer = torch.optim.Adam(cpx_barometer.parameters(),lr=lr)
+    #train barometric model
+    for it in range(20000):
+        y_train_pred = cpx_barometer(Train_data_x)
+        loss_train = criterion(y_train_pred,Train_data_P)
+        optimizer.zero_grad()
+        loss_train.backward()
+        optimizer.step()
+        y_test_pred = cpx_barometer(Test_data_x)
+        loss_test = criterion(y_test_pred,Test_data_P)
+    #save loss values of calibration and validation data
+    train_loss = torch.cat((train_loss,torch.tensor([[loss_train]]).to(device)),1)
+    test_loss = torch.cat((test_loss,torch.tensor([[loss_test]]).to(device)),1)
 
+#torch.save(cpx_barometer.state_dict(),'cpxbar_para.pth')#save pretrained parameters
+plt.hist(train_loss.cpu().detach().numpy().tolist(),histtype='stepfilled', color='w', edgecolor='olivedrab')#plot hisotgram
+plt.hist(test_loss.cpu().detach().numpy().tolist(),histtype='stepfilled', color='w', edgecolor='cadetblue')
+plt.xlabel('Loss')
+plt.ylabel('Frequency')
 
